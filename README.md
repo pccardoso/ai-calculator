@@ -54,8 +54,8 @@ Você: quanto é (12 + 8) * 3 elevado a 2?
 Pré-requisitos: Python 3.10+ e uma chave da API da Anthropic.
 
 ```bash
-git clone <url-do-seu-repo>
-cd <pasta-do-repo>
+git clone https://github.com/pccardoso/ai-calculator.git
+cd ai-calculator
 
 python -m venv .venv
 # Windows
