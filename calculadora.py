@@ -7,11 +7,20 @@ Fluxo do grafo:
                   \
                    --(não tem / limite atingido)--> END
 
-Rodar:
-    pip install -r requirements.txt
-    export ANTHROPIC_API_KEY="sua-chave"
+Rodar (Windows, dentro do venv):
+    python -m pip install -U langgraph langchain-anthropic python-dotenv
+    copie .env.example para .env e preencha as chaves
     python calculadora.py
+
+Com LANGSMITH_TRACING=true no .env, cada pergunta vira um trace em
+https://smith.langchain.com, no projeto definido em LANGSMITH_PROJECT.
 """
+
+# O .env precisa ser carregado ANTES de criar o LLM e o grafo,
+# porque o tracing do LangSmith lê as variáveis de ambiente na inicialização.
+from dotenv import load_dotenv
+
+load_dotenv()
 
 import os
 from typing import Annotated, Literal, TypedDict
@@ -25,6 +34,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langchain_core.tools import tool
+from langchain_core.tracers.langchain import wait_for_all_tracers
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -72,18 +82,12 @@ def dividir(a: float, b: float) -> float:
 
 
 @tool
-def calcular_porcentagem(valor: float, porcentagem: float) -> float:
-    """Calcula a porcentagem de um valor: (valor * porcentagem) / 100."""
-    return (valor * porcentagem) / 100
-
-
-@tool
 def potencia(base: float, expoente: float) -> float:
     """Eleva a base ao expoente: base ** expoente."""
     return base**expoente
 
 
-TOOLS = [somar, subtrair, multiplicar, dividir, calcular_porcentagem, potencia]
+TOOLS = [somar, subtrair, multiplicar, dividir, potencia]
 TOOLS_POR_NOME = {t.name: t for t in TOOLS}
 
 
@@ -174,40 +178,75 @@ def montar_grafo():
 
 
 # ---------------------------------------------------------------------------
-# 7. EXECUÇÃO (mostra cada node rodando)
+# 7. LANGSMITH (só configuração; o tracing é automático)
+# ---------------------------------------------------------------------------
+def status_langsmith() -> bool:
+    ligado = os.getenv("LANGSMITH_TRACING", "").lower() == "true"
+    if ligado and not os.getenv("LANGSMITH_API_KEY"):
+        print("⚠ LANGSMITH_TRACING=true, mas falta LANGSMITH_API_KEY no .env")
+        return False
+    if ligado:
+        projeto = os.getenv("LANGSMITH_PROJECT", "default")
+        print(f"✔ LangSmith ligado: veja os traces no projeto '{projeto}' em https://smith.langchain.com")
+    else:
+        print("ℹ LangSmith desligado (defina LANGSMITH_TRACING=true no .env para ligar)")
+    return ligado
+
+
+# ---------------------------------------------------------------------------
+# 8. EXECUÇÃO (mostra cada node rodando)
 # ---------------------------------------------------------------------------
 def main():
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        print("Falta ANTHROPIC_API_KEY no .env")
+        return
+
+    status_langsmith()
     grafo = montar_grafo()
 
-    print("=== Grafo (Mermaid, cole em https://mermaid.live) ===")
+    print("\n=== Grafo (Mermaid, cole em https://mermaid.live) ===")
     print(grafo.get_graph().draw_mermaid())
 
-    config = {"configurable": {"thread_id": "sessao-1"}}
+    thread_id = "sessao-1"
     print("Digite uma conta (ou 'sair'):")
 
-    while True:
-        pergunta = input("\nVocê: ").strip()
-        if pergunta.lower() in {"sair", "exit", "q"}:
-            break
-        if not pergunta:
-            continue
+    try:
+        while True:
+            pergunta = input("\nVocê: ").strip()
+            if pergunta.lower() in {"sair", "exit", "q"}:
+                break
+            if not pergunta:
+                continue
 
-        entrada = {"messages": [HumanMessage(pergunta)], "passos": 0}
+            entrada = {"messages": [HumanMessage(pergunta)], "passos": 0}
 
-        # stream_mode="updates": a cada passo, devolve {nome_do_node: o_que_ele_retornou}
-        for evento in grafo.stream(entrada, config, stream_mode="updates"):
-            for node, update in evento.items():
-                print(f"\n--> node [{node}]")
-                for msg in update.get("messages", []):
-                    if isinstance(msg, AIMessage) and msg.tool_calls:
-                        for c in msg.tool_calls:
-                            print(f"    pede tool: {c['name']}({c['args']})")
-                    elif isinstance(msg, ToolMessage):
-                        print(f"    {msg.name} = {msg.content}")
-                    else:
-                        print(f"    resposta: {msg.content}")
-                if "passos" in update:
-                    print(f"    passos: {update['passos']}")
+            config = {
+                # usado pelo checkpointer (memória da conversa)
+                "configurable": {"thread_id": thread_id},
+                # usados pelo LangSmith (organizam e filtram os traces no painel)
+                "run_name": "calculadora",
+                "tags": ["estudo", "calculadora"],
+                "metadata": {"thread_id": thread_id, "pergunta": pergunta},
+            }
+
+            # stream_mode="updates": a cada passo, devolve {nome_do_node: o_que_ele_retornou}
+            for evento in grafo.stream(entrada, config, stream_mode="updates"):
+                for node, update in evento.items():
+                    print(f"\n--> node [{node}]")
+                    for msg in update.get("messages", []):
+                        if isinstance(msg, AIMessage) and msg.tool_calls:
+                            for c in msg.tool_calls:
+                                print(f"    pede tool: {c['name']}({c['args']})")
+                        elif isinstance(msg, ToolMessage):
+                            print(f"    {msg.name} = {msg.content}")
+                        else:
+                            print(f"    resposta: {msg.content}")
+                    if "passos" in update:
+                        print(f"    passos: {update['passos']}")
+    finally:
+        # Os traces vão para o LangSmith em segundo plano.
+        # Isso garante que os últimos sejam enviados antes do programa fechar.
+        wait_for_all_tracers()
 
 
 if __name__ == "__main__":
